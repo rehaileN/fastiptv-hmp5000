@@ -8,6 +8,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.*;
+import java.util.zip.GZIPInputStream;
 import javax.net.ssl.*;
 import java.security.cert.X509Certificate;
 
@@ -22,9 +23,10 @@ public class FastDLNAServer {
     private static final String DLNA_PROTOCOL_INFO =
             "http-get:*:video/mpeg:DLNA.ORG_PN=MPEG_TS_SD_EU_ISO;DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=8D700000000000000000000000000000";
 
-    // 256 chunks * 32 KB = 8 MB RAM ring buffer (~15 seconds of HD broadcast cushion)
-    private static final int STREAM_CHUNK_SIZE = 32768;
-    private static final int MAX_BUFFER_CHUNKS = 256;
+    // Exact multiple of 188-byte MPEG-TS packet size: 100 * 188 = 18,800 bytes per chunk.
+    // 450 chunks * 18,800 bytes = ~8.46 MB lossless blocking queue (never drops bytes!).
+    private static final int STREAM_CHUNK_SIZE = 188 * 100;
+    private static final int MAX_BUFFER_CHUNKS = 450;
 
     static class Channel {
         final int id;
@@ -44,9 +46,11 @@ public class FastDLNAServer {
 
     static class CachedVariant {
         final String url;
+        final boolean isHugeDvr;
         final long timestamp;
-        CachedVariant(String url, long timestamp) {
+        CachedVariant(String url, boolean isHugeDvr, long timestamp) {
             this.url = url;
+            this.isHugeDvr = isHugeDvr;
             this.timestamp = timestamp;
         }
     }
@@ -113,46 +117,64 @@ public class FastDLNAServer {
         return list;
     }
 
-    private static String resolveSingleVariant(String masterUrl, int timeoutMs) {
+    private static HttpURLConnection openGzipConnection(String urlStr, int timeoutMs) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URI(urlStr).toURL().openConnection();
+        conn.setRequestProperty("User-Agent", USER_AGENT);
+        conn.setRequestProperty("Accept-Encoding", "gzip");
+        conn.setConnectTimeout(timeoutMs);
+        conn.setReadTimeout(timeoutMs);
+        conn.setInstanceFollowRedirects(true);
+        int code = conn.getResponseCode();
+        if (code >= 300 && code < 400) {
+            String loc = conn.getHeaderField("Location");
+            if (loc != null) {
+                String redir = new URI(urlStr).resolve(loc).toString();
+                conn = (HttpURLConnection) new URI(redir).toURL().openConnection();
+                conn.setRequestProperty("User-Agent", USER_AGENT);
+                conn.setRequestProperty("Accept-Encoding", "gzip");
+                conn.setConnectTimeout(timeoutMs);
+                conn.setReadTimeout(timeoutMs);
+            }
+        }
+        return conn;
+    }
+
+    private static String readAllText(HttpURLConnection conn, int maxLines) throws Exception {
+        InputStream in = conn.getInputStream();
+        if ("gzip".equalsIgnoreCase(conn.getContentEncoding())) {
+            in = new GZIPInputStream(in);
+        }
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
+            String line;
+            int count = 0;
+            while ((line = br.readLine()) != null) {
+                sb.append(line).append("\n");
+                if (maxLines > 0 && ++count >= maxLines) break;
+            }
+        }
+        return sb.toString();
+    }
+
+    private static CachedVariant resolveSingleVariant(String masterUrl, int timeoutMs) {
         long now = System.currentTimeMillis();
         CachedVariant cached = variantCache.get(masterUrl);
-        // 60-second cache TTL so CDN session redirects stay fresh while channel surfing is instant
-        if (cached != null && (now - cached.timestamp) < 60_000) {
-            return cached.url;
+        if (cached != null && (now - cached.timestamp) < 300_000) {
+            return cached;
         }
         try {
-            HttpURLConnection conn = (HttpURLConnection) new URI(masterUrl).toURL().openConnection();
-            conn.setRequestProperty("User-Agent", USER_AGENT);
-            conn.setConnectTimeout(timeoutMs);
-            conn.setReadTimeout(timeoutMs);
-            conn.setInstanceFollowRedirects(true);
-            int code = conn.getResponseCode();
-            if (code >= 300 && code < 400) {
-                String loc = conn.getHeaderField("Location");
-                if (loc != null) {
-                    masterUrl = new URI(masterUrl).resolve(loc).toString();
-                    conn = (HttpURLConnection) new URI(masterUrl).toURL().openConnection();
-                    conn.setRequestProperty("User-Agent", USER_AGENT);
-                    conn.setConnectTimeout(timeoutMs);
-                    conn.setReadTimeout(timeoutMs);
-                }
-            }
+            HttpURLConnection conn = openGzipConnection(masterUrl, timeoutMs);
             String finalUrl = conn.getURL().toString();
-            StringBuilder sb = new StringBuilder();
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                int linesRead = 0;
-                while ((line = br.readLine()) != null && linesRead++ < 200) {
-                    sb.append(line).append("\n");
-                }
-            }
-            String content = sb.toString();
-            // If not a master playlist, or if it uses demuxed separate audio tracks (#EXT-X-MEDIA:TYPE=AUDIO), keep finalUrl
+            String content = readAllText(conn, 250);
+
             if (!content.contains("#EXT-X-STREAM-INF") ||
                 (content.contains("#EXT-X-MEDIA:") && content.contains("TYPE=AUDIO") && content.contains("URI="))) {
-                variantCache.put(masterUrl, new CachedVariant(finalUrl, now));
-                return finalUrl;
+                boolean huge = content.split("\n").length >= 200;
+                CachedVariant cv = new CachedVariant(finalUrl, huge, now);
+                variantCache.put(masterUrl, cv);
+                return cv;
             }
+
             String[] lines = content.split("\n");
             int best720H = -1; long best720Bw = -1; String best720Url = null;
             int best1080H = -1; long best1080Bw = -1; String best1080Url = null;
@@ -192,10 +214,99 @@ public class FastDLNAServer {
                 }
             }
             String chosen = (best720Url != null) ? best720Url : (best1080Url != null ? best1080Url : (bestAnyUrl != null ? bestAnyUrl : finalUrl));
-            variantCache.put(masterUrl, new CachedVariant(chosen, now));
-            return chosen;
+
+            // Check if the chosen sub-playlist is a giant 24-hour DVR playlist (like TRT's 30,000-line master_720.m3u8)
+            boolean isHugeDvr = chosen.contains(".trt.com.tr/");
+            if (!isHugeDvr) {
+                try {
+                    HttpURLConnection subConn = openGzipConnection(chosen, 1500);
+                    String subHead = readAllText(subConn, 180);
+                    if (subHead.split("\n").length >= 150) {
+                        isHugeDvr = true;
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            CachedVariant cv = new CachedVariant(chosen, isHugeDvr, now);
+            variantCache.put(masterUrl, cv);
+            return cv;
         } catch (Exception e) {
-            return masterUrl;
+            return new CachedVariant(masterUrl, false, now);
+        }
+    }
+
+    /**
+     * Trims giant 24-hour DVR playlists (e.g. TRT's 30,246-line / 878 KB playlist)
+     * down to the last 6 live segments (~25 lines) using GZIP so FFmpeg refreshes in 25ms instead of choking every 6s.
+     */
+    private static void handleTrimmedHlsPlaylist(OutputStream out, int chId) throws IOException {
+        Channel target = null;
+        for (Channel c : channels) {
+            if (c.id == chId) { target = c; break; }
+        }
+        if (target == null) {
+            out.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n".getBytes(StandardCharsets.UTF_8));
+            return;
+        }
+        try {
+            CachedVariant cv = resolveSingleVariant(target.url, 2000);
+            HttpURLConnection conn = openGzipConnection(cv.url, 3000);
+            String baseUrl = conn.getURL().toString();
+            String fullText = readAllText(conn, 0);
+            String[] lines = fullText.split("\n");
+
+            List<String> headers = new ArrayList<>();
+            List<List<String>> segments = new ArrayList<>();
+            List<String> currentSeg = new ArrayList<>();
+            long mediaSeq = 0;
+
+            for (String raw : lines) {
+                String line = raw.trim();
+                if (line.isEmpty()) continue;
+                if (line.startsWith("#EXTM3U") || line.startsWith("#EXT-X-VERSION") ||
+                    line.startsWith("#EXT-X-TARGETDURATION") || line.startsWith("#EXT-X-INDEPENDENT-SEGMENTS")) {
+                    headers.add(line);
+                } else if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+                    try {
+                        mediaSeq = Long.parseLong(line.substring("#EXT-X-MEDIA-SEQUENCE:".length()).trim());
+                    } catch (Exception ignored) {}
+                } else if (line.startsWith("#EXTINF:") || line.startsWith("#EXT-X-PROGRAM-DATE-TIME:") || line.startsWith("#EXT-X-KEY:")) {
+                    currentSeg.add(line);
+                } else if (!line.startsWith("#")) {
+                    String absUrl = new URI(baseUrl).resolve(line).toString();
+                    currentSeg.add(absUrl);
+                    segments.add(currentSeg);
+                    currentSeg = new ArrayList<>();
+                }
+            }
+
+            int keepCount = 6;
+            int totalSegs = segments.size();
+            int startIdx = Math.max(0, totalSegs - keepCount);
+            long newMediaSeq = mediaSeq + startIdx;
+
+            StringBuilder m3u8 = new StringBuilder();
+            for (String h : headers) {
+                m3u8.append(h).append("\n");
+            }
+            m3u8.append("#EXT-X-MEDIA-SEQUENCE:").append(newMediaSeq).append("\n");
+            for (int i = startIdx; i < totalSegs; i++) {
+                for (String sLine : segments.get(i)) {
+                    m3u8.append(sLine).append("\n");
+                }
+            }
+
+            byte[] data = m3u8.toString().getBytes(StandardCharsets.UTF_8);
+            String hdr = "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: application/vnd.apple.mpegurl\r\n" +
+                    "Content-Length: " + data.length + "\r\n" +
+                    "Cache-Control: no-cache\r\n" +
+                    "Connection: close\r\n\r\n";
+            out.write(hdr.getBytes(StandardCharsets.UTF_8));
+            out.write(data);
+            out.flush();
+        } catch (Exception e) {
+            out.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".getBytes(StandardCharsets.UTF_8));
         }
     }
 
@@ -334,6 +445,13 @@ public class FastDLNAServer {
                     sendXml(out, CMS_SCPD_XML);
                     return;
                 }
+                if (path.startsWith("/hls/")) {
+                    Matcher hm = Pattern.compile("/hls/(\\d+)\\.m3u8").matcher(path);
+                    if (hm.find()) {
+                        handleTrimmedHlsPlaylist(out, Integer.parseInt(hm.group(1)));
+                        return;
+                    }
+                }
                 if (path.startsWith("/stream/")) {
                     handleStream(s, out, path);
                     return;
@@ -390,7 +508,7 @@ public class FastDLNAServer {
         String hdr = "HTTP/1.1 200 OK\r\n" +
                 "Content-Type: text/xml; charset=\"utf-8\"\r\n" +
                 "Content-Length: " + data.length + "\r\n" +
-                "Server: Windows/10.0 UPnP/1.0 FastIPTV/1.0\r\n" +
+                "Server: Windows/10.0 UPnP/1.0 FastIPTV/1.2\r\n" +
                 "Connection: close\r\n\r\n";
         out.write(hdr.getBytes(StandardCharsets.UTF_8));
         out.write(data);
@@ -484,18 +602,21 @@ public class FastDLNAServer {
             return;
         }
 
-        // Immediately kill any previous channel stream so channel swapping has 0s wait
         killAllActiveStreams();
 
-        // Keep 16KB socket send buffer so pressing Stop/Return on HMP5000 exits immediately
+        // 32KB socket send buffer: fast enough for smooth HD delivery, small enough for instant exit on Stop/Return
         try {
             sock.setTcpNoDelay(true);
-            sock.setSendBufferSize(16384);
+            sock.setSendBufferSize(32768);
             sock.setSoTimeout(0);
         } catch (Exception ignored) {}
 
-        String streamUrl = resolveSingleVariant(target.url, 1800);
-        log("START Channel #" + chId + " (" + target.rawTitle + ") -> " + streamUrl);
+        CachedVariant cv = resolveSingleVariant(target.url, 2000);
+        String ffmpegInputUrl = cv.isHugeDvr
+                ? ("http://127.0.0.1:" + HTTP_PORT + "/hls/" + chId + ".m3u8")
+                : cv.url;
+
+        log("START Channel #" + chId + " (" + target.rawTitle + ") -> " + ffmpegInputUrl + (cv.isHugeDvr ? " [Trimmed Live DVR]" : ""));
 
         String hdr = "HTTP/1.1 200 OK\r\n" +
                 "Content-Type: video/mpeg\r\n" +
@@ -505,10 +626,10 @@ public class FastDLNAServer {
         out.write(hdr.getBytes(StandardCharsets.UTF_8));
         out.flush();
 
-        // Smooth continuous HLS flags:
-        // - reconnects automatically on CDN segment hiccups
-        // - starts 3 segments behind live edge (-live_start_index -3) so CDN segment rollover never starves
-        // - preserves original broadcaster PTS/DTS timestamps (no +nobuffer/+genpts jitter)
+        // Clean, artifact-free MPEG-TS remux pipeline matching hardware decoder requirements:
+        // -fflags +genpts ensures smooth monotonic PTS timestamps
+        // -bsf:v h264_mp4toannexb ensures proper H.264 SPS/PPS Annex-B headers on every keyframe
+        // -c:a ac3 -b:a 384k -ar 48000 ensures rock-solid AC3 audio sync on Realtek RTD1185
         ProcessBuilder pb = new ProcessBuilder(
                 FFMPEG_PATH,
                 "-hide_banner",
@@ -516,20 +637,20 @@ public class FastDLNAServer {
                 "-user_agent", USER_AGENT,
                 "-reconnect", "1",
                 "-reconnect_streamed", "1",
-                "-reconnect_on_network_error", "1",
                 "-reconnect_delay_max", "2",
-                "-rw_timeout", "8000000",
-                "-live_start_index", "-3",
                 "-thread_queue_size", "4096",
-                "-probesize", "3000000",
-                "-analyzeduration", "2000000",
-                "-i", streamUrl,
+                "-probesize", "2000000",
+                "-analyzeduration", "1500000",
+                "-fflags", "+genpts",
+                "-i", ffmpegInputUrl,
                 "-map", "0:v:0",
                 "-map", "0:a:0?",
                 "-sn",
                 "-c:v", "copy",
+                "-bsf:v", "h264_mp4toannexb",
                 "-c:a", "ac3",
-                "-b:a", "256k",
+                "-b:a", "384k",
+                "-ar", "48000",
                 "-f", "mpegts",
                 "pipe:1"
         );
@@ -537,24 +658,27 @@ public class FastDLNAServer {
         Process proc = pb.start();
         activeProcs.add(proc);
 
-        // Decoupled 8 MB RAM Ring-Buffer Queue between FFmpeg stdout and TV TCP socket:
-        // Ensures FFmpeg NEVER blocks when the HMP5000 hardware decoder pauses TCP reads,
-        // while still allowing instant 0ms disconnect when the user exits or changes channels.
+        // Lossless 8.46 MB Blocking Queue (NEVER drops packets! Blocks cleanly when full, unblocks in 0ms on stop)
         BlockingQueue<byte[]> queue = new LinkedBlockingQueue<>(MAX_BUFFER_CHUNKS);
         AtomicBoolean finished = new AtomicBoolean(false);
 
         Thread readerThread = new Thread(() -> {
             try (InputStream ffIn = proc.getInputStream()) {
                 byte[] buf = new byte[STREAM_CHUNK_SIZE];
+                int offset = 0;
                 int r;
-                while (!finished.get() && (r = ffIn.read(buf)) != -1) {
-                    byte[] copy = Arrays.copyOf(buf, r);
-                    while (!queue.offer(copy)) {
-                        // Ring buffer full (TV paused >15s); drop oldest chunk so FFmpeg keeps downloading HLS smoothly
-                        queue.poll();
+                while (!finished.get() && (r = ffIn.read(buf, offset, STREAM_CHUNK_SIZE - offset)) != -1) {
+                    offset += r;
+                    // Flush as soon as we have at least 18,800 bytes (100 MPEG-TS packets)
+                    if (offset == STREAM_CHUNK_SIZE) {
+                        queue.put(Arrays.copyOf(buf, offset));
+                        offset = 0;
                     }
                 }
-            } catch (Exception ignored) {
+                if (!finished.get() && offset > 0) {
+                    queue.put(Arrays.copyOf(buf, offset));
+                }
+            } catch (InterruptedException | IOException ignored) {
             } finally {
                 finished.set(true);
             }
@@ -573,9 +697,10 @@ public class FastDLNAServer {
                 out.flush();
             }
         } catch (Exception ignored) {
-            // Client closed connection (pressed Stop or switched channel)
+            // Client disconnected (Stop/Return or channel switch)
         } finally {
             finished.set(true);
+            readerThread.interrupt();
             queue.clear();
             activeProcs.remove(proc);
             try { proc.destroyForcibly(); } catch (Exception ignored) {}
@@ -605,7 +730,7 @@ public class FastDLNAServer {
                                     "LOCATION: " + loc + "\r\n" +
                                     "NT: " + nt[0] + "\r\n" +
                                     "NTS: ssdp:alive\r\n" +
-                                    "SERVER: Windows/10.0 UPnP/1.0 FastIPTV/1.0\r\n" +
+                                    "SERVER: Windows/10.0 UPnP/1.0 FastIPTV/1.2\r\n" +
                                     "USN: " + nt[1] + "\r\n\r\n";
                             byte[] bytes = msg.getBytes(StandardCharsets.UTF_8);
                             ds.send(new DatagramPacket(bytes, bytes.length, group, 1900));
@@ -652,7 +777,7 @@ public class FastDLNAServer {
                                     "CACHE-CONTROL: max-age=1800\r\n" +
                                     "EXT:\r\n" +
                                     "LOCATION: " + loc + "\r\n" +
-                                    "SERVER: Windows/10.0 UPnP/1.0 FastIPTV/1.0\r\n" +
+                                    "SERVER: Windows/10.0 UPnP/1.0 FastIPTV/1.2\r\n" +
                                     "ST: " + nt[0] + "\r\n" +
                                     "USN: " + nt[1] + "\r\n\r\n";
                             byte[] rBytes = resp.getBytes(StandardCharsets.UTF_8);
@@ -677,7 +802,7 @@ public class FastDLNAServer {
                 "<friendlyName>" + xmlEscape(SERVER_NAME) + "</friendlyName>" +
                 "<manufacturer>Antigravity</manufacturer>" +
                 "<modelName>FastIPTV Live DLNA Proxy</modelName>" +
-                "<modelNumber>1.1</modelNumber>" +
+                "<modelNumber>1.2</modelNumber>" +
                 "<UDN>uuid:" + DEVICE_UUID + "</UDN>" +
                 "<dlna:X_DLNADOC xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">DMS-1.50</dlna:X_DLNADOC>" +
                 "<serviceList>" +
@@ -754,14 +879,21 @@ public class FastDLNAServer {
         List<Channel> loaded = loadChannels();
         log("Loaded " + loaded.size() + " channels from " + M3U_PATH);
 
+        // Background warmer: only runs when NO stream is currently playing so it never competes for bandwidth!
         Thread warmer = new Thread(() -> {
+            for (Channel ch : channels) {
+                if (!activeProcs.isEmpty()) break;
+                resolveSingleVariant(ch.url, 2000);
+            }
+            log("Initial single-variant URL warm-up complete (" + variantCache.size() + " streams).");
             while (true) {
+                try { Thread.sleep(300_000); } catch (InterruptedException ignored) {}
+                if (!activeProcs.isEmpty()) continue;
                 for (Channel ch : channels) {
+                    if (!activeProcs.isEmpty()) break;
                     resolveSingleVariant(ch.url, 2000);
-                    try { Thread.sleep(40); } catch (InterruptedException ignored) {}
+                    try { Thread.sleep(50); } catch (InterruptedException ignored) {}
                 }
-                log("Pre-resolved single-variant URLs for " + variantCache.size() + " streams.");
-                try { Thread.sleep(45_000); } catch (InterruptedException ignored) {}
             }
         });
         warmer.setDaemon(true);
@@ -773,7 +905,7 @@ public class FastDLNAServer {
         try (ServerSocket server = new ServerSocket()) {
             server.setReuseAddress(true);
             server.bind(new InetSocketAddress("0.0.0.0", HTTP_PORT));
-            log("FastIPTV DLNA Server v1.1 (8MB Ring-Buffer) listening on port " + HTTP_PORT);
+            log("FastIPTV DLNA Server v1.2 (Lossless 188-Aligned Buffer + DVR Trimmer) listening on port " + HTTP_PORT);
             while (true) {
                 Socket client = server.accept();
                 pool.submit(() -> handleClient(client));
