@@ -16,7 +16,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 # Configuration
 M3U_PATH = r"C:\IPTV\ulusal50.m3u"
-FFMPEG_PATH = r"C:\Program Files\Serviio\lib\ffmpeg.exe"
+FFMPEG_PATH = r"C:\IPTV\ffmpeg.exe" if os.path.exists(r"C:\IPTV\ffmpeg.exe") else r"C:\Program Files\Serviio\lib\ffmpeg.exe"
 HTTP_PORT = 8899
 SERVER_NAME = "FastIPTV (HMP5000)"
 DEVICE_UUID = "8f7e6d5c-4b3a-2190-89ab-cdef01234567"
