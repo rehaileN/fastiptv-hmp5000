@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import gzip
 import time
 import uuid
 import queue
@@ -20,9 +21,10 @@ HTTP_PORT = 8899
 SERVER_NAME = "FastIPTV (HMP5000)"
 DEVICE_UUID = "8f7e6d5c-4b3a-2190-89ab-cdef01234567"
 
-# 256 chunks * 32 KB = 8 MB RAM ring buffer (~15 seconds of HD broadcast cushion)
-STREAM_CHUNK_SIZE = 32768
-MAX_BUFFER_CHUNKS = 256
+# Exact multiple of 188-byte MPEG-TS packet size: 100 * 188 = 18,800 bytes per chunk.
+# 450 chunks * 18,800 bytes = ~8.46 MB lossless blocking queue (never drops bytes!).
+STREAM_CHUNK_SIZE = 188 * 100
+MAX_BUFFER_CHUNKS = 450
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -32,7 +34,7 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 CHANNELS = []
 CHANNELS_LOCK = threading.Lock()
-VARIANT_CACHE = {}  # url -> (resolved_url, timestamp)
+VARIANT_CACHE = {}  # url -> (resolved_url, is_huge_dvr, timestamp)
 ACTIVE_PROCS = {}   # proc_id -> subprocess.Popen
 ACTIVE_PROCS_LOCK = threading.Lock()
 
@@ -67,23 +69,33 @@ def parse_m3u(path):
     return channels
 
 
+def fetch_gzip_text(url, timeout=2.5, max_bytes=0):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+        final_url = resp.geturl()
+        raw = resp.read(max_bytes) if max_bytes > 0 else resp.read()
+        if resp.headers.get("Content-Encoding", "").lower() == "gzip":
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        return final_url, raw.decode("utf-8", errors="ignore")
+
+
 def resolve_single_variant(master_url, timeout=2.0):
     now = time.time()
     cached = VARIANT_CACHE.get(master_url)
-    if cached and (now - cached[1]) < 60:
-        return cached[0]
+    if cached and (now - cached[2]) < 300:
+        return cached[0], cached[1]
 
     try:
-        req = urllib.request.Request(master_url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
-            final_url = resp.geturl()
-            content = resp.read(65536).decode("utf-8", errors="ignore")
-
+        final_url, content = fetch_gzip_text(master_url, timeout=timeout)
         if "#EXT-X-STREAM-INF" not in content or (
             "#EXT-X-MEDIA:" in content and "TYPE=AUDIO" in content and "URI=" in content
         ):
-            VARIANT_CACHE[master_url] = (final_url, now)
-            return final_url
+            huge = len(content.splitlines()) >= 200
+            VARIANT_CACHE[master_url] = (final_url, huge, now)
+            return final_url, huge
 
         lines = [l.strip() for l in content.splitlines() if l.strip()]
         variants = []
@@ -100,8 +112,8 @@ def resolve_single_variant(master_url, timeout=2.0):
                         break
 
         if not variants:
-            VARIANT_CACHE[master_url] = (final_url, now)
-            return final_url
+            VARIANT_CACHE[master_url] = (final_url, False, now)
+            return final_url, False
 
         preferred_720 = [v for v in variants if 540 <= v[0] <= 720]
         preferred_1080 = [v for v in variants if 0 < v[0] <= 1080]
@@ -112,20 +124,34 @@ def resolve_single_variant(master_url, timeout=2.0):
         else:
             chosen = sorted(variants, key=lambda x: x[1])[-1][2]
 
-        VARIANT_CACHE[master_url] = (chosen, now)
-        return chosen
+        is_huge_dvr = ".trt.com.tr/" in chosen
+        VARIANT_CACHE[master_url] = (chosen, is_huge_dvr, now)
+        return chosen, is_huge_dvr
     except Exception:
-        return master_url
+        return master_url, False
 
 
 def background_variant_warmer():
+    with CHANNELS_LOCK:
+        ch_list = list(CHANNELS)
+    for ch in ch_list:
+        with ACTIVE_PROCS_LOCK:
+            if ACTIVE_PROCS:
+                break
+        resolve_single_variant(ch["url"], timeout=2.0)
     while True:
+        time.sleep(300)
+        with ACTIVE_PROCS_LOCK:
+            if ACTIVE_PROCS:
+                continue
         with CHANNELS_LOCK:
             ch_list = list(CHANNELS)
         for ch in ch_list:
+            with ACTIVE_PROCS_LOCK:
+                if ACTIVE_PROCS:
+                    break
             resolve_single_variant(ch["url"], timeout=2.0)
-            time.sleep(0.04)
-        time.sleep(45)
+            time.sleep(0.05)
 
 
 def kill_all_active_streams():
@@ -285,7 +311,7 @@ class DLNAHandler(BaseHTTPRequestHandler):
     <friendlyName>{xml_escape(SERVER_NAME)}</friendlyName>
     <manufacturer>Antigravity</manufacturer>
     <modelName>FastIPTV Live DLNA Proxy</modelName>
-    <modelNumber>1.1</modelNumber>
+    <modelNumber>1.2</modelNumber>
     <UDN>uuid:{DEVICE_UUID}</UDN>
     <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMS-1.50</dlna:X_DLNADOC>
     <serviceList>
@@ -314,12 +340,68 @@ class DLNAHandler(BaseHTTPRequestHandler):
         if self.path == "/cms.xml":
             return self.send_xml(CMS_SCPD_XML)
 
+        if self.path.startswith("/hls/"):
+            return self.handle_trimmed_hls()
+
         if self.path.startswith("/stream/"):
             return self.handle_stream()
 
         self.send_response(404)
         self.send_header("Connection", "close")
         self.end_headers()
+
+    def handle_trimmed_hls(self):
+        m = re.search(r"/hls/(\d+)\.m3u8", self.path)
+        if not m:
+            self.send_response(404)
+            self.end_headers()
+            return
+        ch_id = int(m.group(1))
+        with CHANNELS_LOCK:
+            ch = next((c for c in CHANNELS if c["id"] == ch_id), None)
+        if not ch:
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            var_url, _ = resolve_single_variant(ch["url"], timeout=2.0)
+            base_url, full_text = fetch_gzip_text(var_url, timeout=3.0)
+            headers = []
+            segments = []
+            cur_seg = []
+            media_seq = 0
+            for raw in full_text.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(("#EXTM3U", "#EXT-X-VERSION", "#EXT-X-TARGETDURATION", "#EXT-X-INDEPENDENT-SEGMENTS")):
+                    headers.append(line)
+                elif line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+                    try:
+                        media_seq = int(line.split(":", 1)[1].strip())
+                    except Exception:
+                        pass
+                elif line.startswith(("#EXTINF:", "#EXT-X-PROGRAM-DATE-TIME:", "#EXT-X-KEY:")):
+                    cur_seg.append(line)
+                elif not line.startswith("#"):
+                    cur_seg.append(urllib.parse.urljoin(base_url, line))
+                    segments.append(cur_seg)
+                    cur_seg = []
+            keep = 6
+            start_idx = max(0, len(segments) - keep)
+            out_lines = headers + [f"#EXT-X-MEDIA-SEQUENCE:{media_seq + start_idx}"]
+            for seg in segments[start_idx:]:
+                out_lines.extend(seg)
+            data = ("\n".join(out_lines) + "\n").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception:
+            self.send_response(502)
+            self.end_headers()
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -482,12 +564,14 @@ class DLNAHandler(BaseHTTPRequestHandler):
 
         try:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
         except Exception:
             pass
 
-        stream_url = resolve_single_variant(ch["url"], timeout=1.8)
-        sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Starting channel #{ch_id} ({ch['raw_title']}) -> {stream_url}\n")
+        stream_url, is_huge_dvr = resolve_single_variant(ch["url"], timeout=2.0)
+        ffmpeg_input = f"http://127.0.0.1:{HTTP_PORT}/hls/{ch_id}.m3u8" if is_huge_dvr else stream_url
+
+        sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Starting channel #{ch_id} ({ch['raw_title']}) -> {ffmpeg_input}\n")
         sys.stdout.flush()
 
         self.send_response(200)
@@ -504,20 +588,20 @@ class DLNAHandler(BaseHTTPRequestHandler):
             "-user_agent", USER_AGENT,
             "-reconnect", "1",
             "-reconnect_streamed", "1",
-            "-reconnect_on_network_error", "1",
             "-reconnect_delay_max", "2",
-            "-rw_timeout", "8000000",
-            "-live_start_index", "-3",
             "-thread_queue_size", "4096",
-            "-probesize", "3000000",
-            "-analyzeduration", "2000000",
-            "-i", stream_url,
+            "-probesize", "2000000",
+            "-analyzeduration", "1500000",
+            "-fflags", "+genpts",
+            "-i", ffmpeg_input,
             "-map", "0:v:0",
             "-map", "0:a:0?",
             "-sn",
             "-c:v", "copy",
+            "-bsf:v", "h264_mp4toannexb",
             "-c:a", "ac3",
-            "-b:a", "256k",
+            "-b:a", "384k",
+            "-ar", "48000",
             "-f", "mpegts",
             "pipe:1"
         ]
@@ -533,6 +617,7 @@ class DLNAHandler(BaseHTTPRequestHandler):
         with ACTIVE_PROCS_LOCK:
             ACTIVE_PROCS[proc_id] = proc
 
+        # Lossless blocking queue (NEVER drops chunks!)
         ring_q = queue.Queue(maxsize=MAX_BUFFER_CHUNKS)
         stop_evt = threading.Event()
 
@@ -544,13 +629,10 @@ class DLNAHandler(BaseHTTPRequestHandler):
                         break
                     while not stop_evt.is_set():
                         try:
-                            ring_q.put_nowait(chunk)
+                            ring_q.put(chunk, timeout=0.5)
                             break
                         except queue.Full:
-                            try:
-                                ring_q.get_nowait()
-                            except queue.Empty:
-                                pass
+                            continue
             except Exception:
                 pass
             finally:
@@ -606,7 +688,7 @@ def send_ssdp_alive_loop():
                         f"LOCATION: {location}\r\n"
                         f"NT: {nt}\r\n"
                         "NTS: ssdp:alive\r\n"
-                        "SERVER: Windows/10.0 UPnP/1.0 FastIPTV/1.1\r\n"
+                        "SERVER: Windows/10.0 UPnP/1.0 FastIPTV/1.2\r\n"
                         f"USN: {usn}\r\n\r\n"
                     ).encode("utf-8")
                     s.sendto(msg, ("239.255.255.250", 1900))
@@ -668,7 +750,7 @@ def ssdp_responder_loop():
                     "CACHE-CONTROL: max-age=1800\r\n"
                     "EXT:\r\n"
                     f"LOCATION: {location}\r\n"
-                    "SERVER: Windows/10.0 UPnP/1.0 FastIPTV/1.1\r\n"
+                    "SERVER: Windows/10.0 UPnP/1.0 FastIPTV/1.2\r\n"
                     f"ST: {st_val}\r\n"
                     f"USN: {usn_val}\r\n\r\n"
                 ).encode("utf-8")
@@ -681,7 +763,7 @@ def main():
     global CHANNELS
     CHANNELS = parse_m3u(M3U_PATH)
     print(f"Loaded {len(CHANNELS)} channels from {M3U_PATH}")
-    print(f"Starting {SERVER_NAME} v1.1 (8MB Ring-Buffer) on port {HTTP_PORT}")
+    print(f"Starting {SERVER_NAME} v1.2 (Lossless 188-Aligned Buffer + DVR Trimmer) on port {HTTP_PORT}")
 
     threading.Thread(target=background_variant_warmer, daemon=True).start()
     threading.Thread(target=send_ssdp_alive_loop, daemon=True).start()
