@@ -15,7 +15,9 @@ import java.security.cert.X509Certificate;
 public class FastDLNAServer {
     private static final String M3U_PATH = "C:\\IPTV\\ulusal50.m3u";
     private static final String LOG_PATH = "C:\\IPTV\\fast_dlna.log";
-    private static final String FFMPEG_PATH = "C:\\Program Files\\Serviio\\lib\\ffmpeg.exe";
+    private static final String FFMPEG_PATH = Files.exists(Paths.get("C:\\IPTV\\ffmpeg.exe"))
+            ? "C:\\IPTV\\ffmpeg.exe"
+            : "C:\\Program Files\\Serviio\\lib\\ffmpeg.exe";
     private static final int HTTP_PORT = 8899;
     private static final String SERVER_NAME = "FastIPTV (HMP5000)";
     private static final String DEVICE_UUID = "8f7e6d5c-4b3a-2190-89ab-cdef01234567";
