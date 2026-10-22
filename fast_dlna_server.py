@@ -22,9 +22,10 @@ SERVER_NAME = "FastIPTV (HMP5000)"
 DEVICE_UUID = "8f7e6d5c-4b3a-2190-89ab-cdef01234567"
 
 # Exact multiple of 188-byte MPEG-TS packet size: 100 * 188 = 18,800 bytes per chunk.
-# 450 chunks * 18,800 bytes = ~8.46 MB lossless blocking queue (never drops bytes!).
+# 900 chunks * 18,800 bytes = ~16.92 MB lossless blocking queue (never drops bytes, holds 30s+ of 4.7 Mbps TRT HD!).
 STREAM_CHUNK_SIZE = 188 * 100
-MAX_BUFFER_CHUNKS = 450
+MAX_BUFFER_CHUNKS = 900
+SOCKET_SEND_BUFFER = 262144
 
 SSL_CTX = ssl.create_default_context()
 SSL_CTX.check_hostname = False
@@ -34,8 +35,9 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 CHANNELS = []
 CHANNELS_LOCK = threading.Lock()
-VARIANT_CACHE = {}  # url -> (resolved_url, is_huge_dvr, timestamp)
-ACTIVE_PROCS = {}   # proc_id -> subprocess.Popen
+VARIANT_CACHE = {}   # url -> (resolved_url, is_huge_dvr, timestamp)
+PLAYLIST_CACHE = {}  # ch_id -> (bytes, timestamp)
+ACTIVE_PROCS = {}    # proc_id -> subprocess.Popen
 ACTIVE_PROCS_LOCK = threading.Lock()
 
 
@@ -363,14 +365,25 @@ class DLNAHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
+        now = time.time()
+        cached_pl = PLAYLIST_CACHE.get(ch_id)
+        if cached_pl and (now - cached_pl[1]) < 1.5:
+            data = cached_pl[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         try:
             var_url, _ = resolve_single_variant(ch["url"], timeout=2.0)
             base_url, full_text = fetch_gzip_text(var_url, timeout=3.0)
+            lines = full_text.splitlines()
             headers = []
-            segments = []
-            cur_seg = []
             media_seq = 0
-            for raw in full_text.splitlines():
+            for raw in lines[:30]:
                 line = raw.strip()
                 if not line:
                     continue
@@ -381,21 +394,34 @@ class DLNAHandler(BaseHTTPRequestHandler):
                         media_seq = int(line.split(":", 1)[1].strip())
                     except Exception:
                         pass
-                elif line.startswith(("#EXTINF:", "#EXT-X-PROGRAM-DATE-TIME:", "#EXT-X-KEY:")):
-                    cur_seg.append(line)
-                elif not line.startswith("#"):
-                    cur_seg.append(urllib.parse.urljoin(base_url, line))
-                    segments.append(cur_seg)
-                    cur_seg = []
-            keep = 6
-            start_idx = max(0, len(segments) - keep)
+            keep = 12
+            total_segs = 0
+            tail_start = 0
+            for i in range(len(lines) - 1, -1, -1):
+                l = lines[i].strip()
+                if l and not l.startswith("#"):
+                    total_segs += 1
+                    if total_segs == keep:
+                        k = i
+                        while k > 0 and lines[k - 1].strip().startswith(("#EXTINF:", "#EXT-X-PROGRAM-DATE-TIME:", "#EXT-X-KEY:")):
+                            k -= 1
+                        tail_start = k
+            start_idx = max(0, total_segs - keep)
             out_lines = headers + [f"#EXT-X-MEDIA-SEQUENCE:{media_seq + start_idx}"]
-            for seg in segments[start_idx:]:
-                out_lines.extend(seg)
+            for raw in lines[tail_start:]:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith(("#EXTINF:", "#EXT-X-PROGRAM-DATE-TIME:", "#EXT-X-KEY:")):
+                    out_lines.append(line)
+                elif not line.startswith("#"):
+                    out_lines.append(urllib.parse.urljoin(base_url, line))
             data = ("\n".join(out_lines) + "\n").encode("utf-8")
+            PLAYLIST_CACHE[ch_id] = (data, time.time())
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.apple.mpegurl")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(data)
@@ -564,7 +590,7 @@ class DLNAHandler(BaseHTTPRequestHandler):
 
         try:
             self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER)
         except Exception:
             pass
 
@@ -589,22 +615,30 @@ class DLNAHandler(BaseHTTPRequestHandler):
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "2",
+        ]
+        if is_huge_dvr:
+            cmd.extend(["-live_start_index", "-5"])
+        cmd.extend([
             "-thread_queue_size", "4096",
             "-probesize", "2000000",
             "-analyzeduration", "1500000",
-            "-fflags", "+genpts",
+            "-fflags", "+genpts+discardcorrupt",
             "-i", ffmpeg_input,
             "-map", "0:v:0",
             "-map", "0:a:0?",
             "-sn",
+            "-dn",
             "-c:v", "copy",
             "-bsf:v", "h264_mp4toannexb",
+            "-af", "aresample=async=1:first_pts=0",
             "-c:a", "ac3",
             "-b:a", "384k",
             "-ar", "48000",
+            "-avoid_negative_ts", "make_zero",
+            "-max_interleave_delta", "0",
             "-f", "mpegts",
             "pipe:1"
-        ]
+        ])
 
         proc_id = uuid.uuid4().hex
         proc = subprocess.Popen(
