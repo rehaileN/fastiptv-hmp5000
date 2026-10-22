@@ -9,7 +9,7 @@ echo Compiling FastDLNAServer.java...
 "C:\Program Files\eclipse adoptium\jdk-21.0.4.7-hotspot\bin\javac.exe" -encoding UTF-8 FastDLNAServer.java
 
 echo Starting FastIPTV (HMP5000) DLNA Server in the background...
-start "" "C:\Program Files\eclipse adoptium\jdk-21.0.4.7-hotspot\bin\javaw.exe" -Xmx96m -cp C:\IPTV FastDLNAServer
+start "" "C:\Program Files\eclipse adoptium\jdk-21.0.4.7-hotspot\bin\javaw.exe" -Xmx192m -cp C:\IPTV FastDLNAServer
 
 echo.
 echo ========================================================
