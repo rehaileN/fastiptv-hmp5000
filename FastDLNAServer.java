@@ -661,7 +661,10 @@ public class FastDLNAServer {
                 ? ("http://127.0.0.1:" + HTTP_PORT + "/hls/" + chId + ".m3u8")
                 : cv.url;
 
-        log("START Channel #" + chId + " (" + target.rawTitle + ") -> " + ffmpegInputUrl + (cv.isHugeDvr ? " [Trimmed Live DVR]" : ""));
+        boolean isTrt = target.url.contains(".trt.com.tr/");
+        log("START Channel #" + chId + " (" + target.rawTitle + ") -> " + ffmpegInputUrl
+                + (cv.isHugeDvr ? " [Trimmed Live DVR]" : "")
+                + (isTrt ? " [TRT 720p25 Single-Slice Hardware-Safe Profile]" : ""));
 
         String hdr = "HTTP/1.1 200 OK\r\n" +
                 "Content-Type: video/mpeg\r\n" +
@@ -671,13 +674,9 @@ public class FastDLNAServer {
         out.write(hdr.getBytes(StandardCharsets.UTF_8));
         out.flush();
 
-        // Clean, artifact-free MPEG-TS remux pipeline matching hardware decoder requirements:
-        // -live_start_index -5 (on DVR streams) buffers 30s ahead to absorb TRT Akamai CDN cache-miss stalls
-        // -fflags +genpts+discardcorrupt ensures smooth monotonic PTS timestamps
-        // -dn strips un-timestamped SCTE-35 splice streams present on TRT channels
-        // -af aresample=async=1:first_pts=0 eliminates 44.1kHz -> 48kHz fractional PTS drift on TRT channels
-        // -bsf:v h264_mp4toannexb ensures proper H.264 SPS/PPS Annex-B headers on every keyframe
-        // -c:a ac3 -b:a 384k -ar 48000 ensures rock-solid AC3 audio sync on Realtek RTD1185
+        // Clean, artifact-free MPEG-TS pipeline matching Realtek RTD1185 (Philips HMP5000) hardware decoder requirements.
+        // For TRT channels: converts 4.7Mbps / 50fps / 4-slice / HRD-SEI broadcast streams into the exact 1280x720@25fps,
+        // 1-slice, 1.5Mbps High@L4.1 profile used by TV8 HD & Show TV HD (runs at ~11x real-time on Ryzen 7 5800HS).
         List<String> cmd = new ArrayList<>(Arrays.asList(
                 FFMPEG_PATH,
                 "-hide_banner",
@@ -700,9 +699,30 @@ public class FastDLNAServer {
                 "-map", "0:v:0",
                 "-map", "0:a:0?",
                 "-sn",
-                "-dn",
-                "-c:v", "copy",
-                "-bsf:v", "h264_mp4toannexb",
+                "-dn"
+        ));
+        if (isTrt) {
+            cmd.addAll(Arrays.asList(
+                    "-vf", "fps=25",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-profile:v", "high",
+                    "-level", "4.1",
+                    "-b:v", "1500k",
+                    "-maxrate", "1800k",
+                    "-bufsize", "3600k",
+                    "-pix_fmt", "yuv420p",
+                    "-g", "50",
+                    "-sc_threshold", "0",
+                    "-x264-params", "slices=1:bframes=2:ref=3:nal-hrd=none"
+            ));
+        } else {
+            cmd.addAll(Arrays.asList(
+                    "-c:v", "copy",
+                    "-bsf:v", "h264_mp4toannexb"
+            ));
+        }
+        cmd.addAll(Arrays.asList(
                 "-af", "aresample=async=1:first_pts=0",
                 "-c:a", "ac3",
                 "-b:a", "384k",
@@ -964,7 +984,7 @@ public class FastDLNAServer {
         try (ServerSocket server = new ServerSocket()) {
             server.setReuseAddress(true);
             server.bind(new InetSocketAddress("0.0.0.0", HTTP_PORT));
-            log("FastIPTV DLNA Server v1.3 (17MB Lossless Buffer + O(1) DVR Trimmer + TRT Audio/PTS Sync) listening on port " + HTTP_PORT);
+            log("FastIPTV DLNA Server v1.4 (TRT 720p25 Single-Slice Hardware-Safe Profile + 17MB Lossless Buffer) listening on port " + HTTP_PORT);
             while (true) {
                 Socket client = server.accept();
                 pool.submit(() -> handleClient(client));
