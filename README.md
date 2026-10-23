@@ -1,8 +1,9 @@
-# FastIPTV (HMP5000/12 Ultra-Lightweight DLNA Server) — v1.4
+# FastIPTV (HMP5000/12 Ultra-Lightweight DLNA Server) — v1.5
 
 A lightweight, zero-lag UPnP/DLNA live IPTV server and HLS-to-MPEG-TS proxy built specifically for legacy hardware media players like the **Philips HMP5000/12** (Realtek RTD1185).
 
-## Features (v1.4)
+## Features (v1.5)
+- **Windows System Tray Status Icon (`v1.5`):** Displays a live TV icon in the Windows notification area (system tray) — **Emerald Green** when running idle on port `8899` and **Sky Blue** when actively streaming a channel to the TV, with hover tooltip status and right-click quick actions (Open Log, Open Playlist, Reload Channels, Stop & Exit).
 - **TRT 720p25 Single-Slice Hardware-Safe Profile (`v1.4`):** Converts TRT's broadcast-encoded streams (`4.7 Mbps`, `50 fps` on TRT 1, `4 slices/frame`, `122 KB` keyframes, and conflicting HRD/SEI `cpb_removal_delay` / `bottom_field_pic_order` flags) on-the-fly at ~11x real-time into the exact `1280x720 @ 25 fps`, **single-slice (`slices=1`)**, `1.5 Mbps` High@L4.1 bitstream profile used by `TV8 HD` and `Show TV HD`. All other channels continue using zero-CPU `-c:v copy`.
 - **Lossless 188-Byte Aligned Blocking Queue (~16.92 MB):** Decouples `ffmpeg` stdout from the TV's TCP socket using `18,800-byte` chunks (`100 * 188-byte` MPEG-TS packets) and a **lossless blocking `put()`** (`900` chunks = `16.92 MB`) so **not a single byte or H.264 reference frame is ever dropped**.
 - **256 KB Socket Send Buffer & Instant Teardown:** Uses a `256 KB` TCP socket send buffer (`SO_SNDBUF`) with `TCP_NODELAY` so keyframes fit in a single TCP window without Wi-Fi ACK stalls, while still draining in `< 0.2s` on client disconnect.
