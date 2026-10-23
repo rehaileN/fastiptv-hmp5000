@@ -597,7 +597,11 @@ class DLNAHandler(BaseHTTPRequestHandler):
         stream_url, is_huge_dvr = resolve_single_variant(ch["url"], timeout=2.0)
         ffmpeg_input = f"http://127.0.0.1:{HTTP_PORT}/hls/{ch_id}.m3u8" if is_huge_dvr else stream_url
 
-        sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] Starting channel #{ch_id} ({ch['raw_title']}) -> {ffmpeg_input}\n")
+        is_trt = ".trt.com.tr/" in ch["url"]
+        sys.stdout.write(
+            f"[{time.strftime('%H:%M:%S')}] Starting channel #{ch_id} ({ch['raw_title']}) -> {ffmpeg_input}"
+            f"{' [TRT 720p25 Single-Slice]' if is_trt else ''}\n"
+        )
         sys.stdout.flush()
 
         self.send_response(200)
@@ -628,8 +632,28 @@ class DLNAHandler(BaseHTTPRequestHandler):
             "-map", "0:a:0?",
             "-sn",
             "-dn",
-            "-c:v", "copy",
-            "-bsf:v", "h264_mp4toannexb",
+        ])
+        if is_trt:
+            cmd.extend([
+                "-vf", "fps=25",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-profile:v", "high",
+                "-level", "4.1",
+                "-b:v", "1500k",
+                "-maxrate", "1800k",
+                "-bufsize", "3600k",
+                "-pix_fmt", "yuv420p",
+                "-g", "50",
+                "-sc_threshold", "0",
+                "-x264-params", "slices=1:bframes=2:ref=3:nal-hrd=none",
+            ])
+        else:
+            cmd.extend([
+                "-c:v", "copy",
+                "-bsf:v", "h264_mp4toannexb",
+            ])
+        cmd.extend([
             "-af", "aresample=async=1:first_pts=0",
             "-c:a", "ac3",
             "-b:a", "384k",
