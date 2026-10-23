@@ -1,3 +1,5 @@
+import java.awt.*;
+import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
@@ -5,6 +7,7 @@ import java.nio.file.*;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.*;
@@ -72,6 +75,101 @@ public class FastDLNAServer {
     private static final Map<Integer, CachedPlaylist> playlistCache = new ConcurrentHashMap<>();
     private static final Set<Process> activeProcs = ConcurrentHashMap.newKeySet();
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
+    private static volatile TrayIcon trayIcon = null;
+    private static volatile MenuItem statusMenuItem = null;
+    private static volatile Image idleTrayImage = null;
+    private static volatile Image activeTrayImage = null;
+
+    private static Image createTrayImage(Color bgColor) {
+        int size = 32;
+        BufferedImage img = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = img.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        // Rounded TV screen body
+        g.setColor(bgColor);
+        g.fillRoundRect(2, 4, 28, 22, 8, 8);
+        g.setColor(Color.WHITE);
+        g.setStroke(new BasicStroke(2.2f));
+        g.drawRoundRect(2, 4, 28, 22, 8, 8);
+        // TV stand
+        g.drawLine(11, 29, 21, 29);
+        g.drawLine(16, 26, 16, 29);
+        // Play triangle inside TV
+        int[] px = {13, 13, 21};
+        int[] py = {10, 20, 15};
+        g.fillPolygon(px, py, 3);
+        g.dispose();
+        return img;
+    }
+
+    private static void initSystemTray() {
+        if (!SystemTray.isSupported()) return;
+        try {
+            idleTrayImage = createTrayImage(new Color(16, 185, 129));   // Emerald Green (Running/Idle)
+            activeTrayImage = createTrayImage(new Color(14, 165, 233)); // Sky Blue (Streaming Channel)
+
+            PopupMenu popup = new PopupMenu();
+            statusMenuItem = new MenuItem("FastIPTV v1.5 — Running (Idle on :8899)");
+            statusMenuItem.setEnabled(false);
+            popup.add(statusMenuItem);
+            popup.addSeparator();
+
+            MenuItem openLogItem = new MenuItem("Open Log (fast_dlna.log)");
+            openLogItem.addActionListener(e -> {
+                try { Desktop.getDesktop().open(new File(LOG_PATH)); } catch (Exception ignored) {}
+            });
+            popup.add(openLogItem);
+
+            MenuItem openM3uItem = new MenuItem("Open Channel List (ulusal50.m3u)");
+            openM3uItem.addActionListener(e -> {
+                try { Desktop.getDesktop().open(new File(M3U_PATH)); } catch (Exception ignored) {}
+            });
+            popup.add(openM3uItem);
+
+            MenuItem reloadItem = new MenuItem("Reload Channels");
+            reloadItem.addActionListener(e -> {
+                List<Channel> reloaded = loadChannels();
+                log("Reloaded " + reloaded.size() + " channels via Tray menu.");
+            });
+            popup.add(reloadItem);
+
+            popup.addSeparator();
+            MenuItem exitItem = new MenuItem("Stop & Exit FastIPTV");
+            exitItem.addActionListener(e -> {
+                killAllActiveStreams();
+                log("FastIPTV stopped by user via System Tray.");
+                try { SystemTray.getSystemTray().remove(trayIcon); } catch (Exception ignored) {}
+                System.exit(0);
+            });
+            popup.add(exitItem);
+
+            trayIcon = new TrayIcon(idleTrayImage, "FastIPTV (HMP5000) v1.5 — Running (:8899)", popup);
+            trayIcon.setImageAutoSize(true);
+            trayIcon.addActionListener(e -> {
+                try { Desktop.getDesktop().open(new File(LOG_PATH)); } catch (Exception ignored) {}
+            });
+            SystemTray.getSystemTray().add(trayIcon);
+        } catch (Exception e) {
+            log("Tray icon note: " + e.getMessage());
+        }
+    }
+
+    private static void updateTrayStatus(String activeChannel) {
+        TrayIcon ti = trayIcon;
+        MenuItem mi = statusMenuItem;
+        if (ti == null) return;
+        try {
+            if (activeChannel != null) {
+                ti.setImage(activeTrayImage);
+                ti.setToolTip("FastIPTV — Playing: " + activeChannel);
+                if (mi != null) mi.setLabel("Playing: " + activeChannel);
+            } else {
+                ti.setImage(idleTrayImage);
+                ti.setToolTip("FastIPTV (HMP5000) v1.5 — Running (:8899)");
+                if (mi != null) mi.setLabel("FastIPTV v1.5 — Running (Idle on :8899)");
+            }
+        } catch (Exception ignored) {}
+    }
 
     private static synchronized void log(String msg) {
         String line = "[" + LocalTime.now().format(TIME_FMT) + "] " + msg;
@@ -736,6 +834,7 @@ public class FastDLNAServer {
         pb.redirectError(ProcessBuilder.Redirect.DISCARD);
         Process proc = pb.start();
         activeProcs.add(proc);
+        updateTrayStatus(target.title);
 
         // Lossless 16.92 MB Blocking Queue (NEVER drops packets! Blocks cleanly when full, unblocks in 0ms on stop)
         BlockingQueue<byte[]> queue = new LinkedBlockingQueue<>(MAX_BUFFER_CHUNKS);
@@ -783,6 +882,7 @@ public class FastDLNAServer {
             queue.clear();
             activeProcs.remove(proc);
             try { proc.destroyForcibly(); } catch (Exception ignored) {}
+            if (activeProcs.isEmpty()) updateTrayStatus(null);
             log("STOP Channel #" + chId + " (" + target.rawTitle + ") immediately.");
         }
     }
@@ -957,6 +1057,7 @@ public class FastDLNAServer {
         trustAllSSL();
         List<Channel> loaded = loadChannels();
         log("Loaded " + loaded.size() + " channels from " + M3U_PATH);
+        initSystemTray();
 
         // Background warmer: only runs when NO stream is currently playing so it never competes for bandwidth!
         Thread warmer = new Thread(() -> {
@@ -984,7 +1085,7 @@ public class FastDLNAServer {
         try (ServerSocket server = new ServerSocket()) {
             server.setReuseAddress(true);
             server.bind(new InetSocketAddress("0.0.0.0", HTTP_PORT));
-            log("FastIPTV DLNA Server v1.4 (TRT 720p25 Single-Slice Hardware-Safe Profile + 17MB Lossless Buffer) listening on port " + HTTP_PORT);
+            log("FastIPTV DLNA Server v1.5 (System Tray Icon + TRT 720p25 Single-Slice + 17MB Lossless Buffer) listening on port " + HTTP_PORT);
             while (true) {
                 Socket client = server.accept();
                 pool.submit(() -> handleClient(client));
