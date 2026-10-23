@@ -1,10 +1,11 @@
-# FastIPTV (HMP5000/12 Ultra-Lightweight DLNA Server) — v1.3
+# FastIPTV (HMP5000/12 Ultra-Lightweight DLNA Server) — v1.4
 
 A lightweight, zero-lag UPnP/DLNA live IPTV server and HLS-to-MPEG-TS proxy built specifically for legacy hardware media players like the **Philips HMP5000/12** (Realtek RTD1185).
 
-## Features (v1.3)
-- **Lossless 188-Byte Aligned Blocking Queue (~16.92 MB):** Decouples `ffmpeg` stdout from the TV's TCP socket using `18,800-byte` chunks (`100 * 188-byte` MPEG-TS packets) and a **lossless blocking `put()`** (`900` chunks = `16.92 MB`, holding 30s+ of high-bitrate 4.7 Mbps TRT HD streams) so **not a single byte or H.264 reference frame is ever dropped**.
-- **256 KB Socket Send Buffer & Instant Teardown:** Uses a `256 KB` TCP socket send buffer (`SO_SNDBUF`) with `TCP_NODELAY` so large `122 KB` TRT HD keyframes fit in a single TCP window without Wi-Fi ACK stalls, while still draining in `< 0.2s` on client disconnect.
+## Features (v1.4)
+- **TRT 720p25 Single-Slice Hardware-Safe Profile (`v1.4`):** Converts TRT's broadcast-encoded streams (`4.7 Mbps`, `50 fps` on TRT 1, `4 slices/frame`, `122 KB` keyframes, and conflicting HRD/SEI `cpb_removal_delay` / `bottom_field_pic_order` flags) on-the-fly at ~11x real-time into the exact `1280x720 @ 25 fps`, **single-slice (`slices=1`)**, `1.5 Mbps` High@L4.1 bitstream profile used by `TV8 HD` and `Show TV HD`. All other channels continue using zero-CPU `-c:v copy`.
+- **Lossless 188-Byte Aligned Blocking Queue (~16.92 MB):** Decouples `ffmpeg` stdout from the TV's TCP socket using `18,800-byte` chunks (`100 * 188-byte` MPEG-TS packets) and a **lossless blocking `put()`** (`900` chunks = `16.92 MB`) so **not a single byte or H.264 reference frame is ever dropped**.
+- **256 KB Socket Send Buffer & Instant Teardown:** Uses a `256 KB` TCP socket send buffer (`SO_SNDBUF`) with `TCP_NODELAY` so keyframes fit in a single TCP window without Wi-Fi ACK stalls, while still draining in `< 0.2s` on client disconnect.
 - **O(1) Tail-Scanner Live DVR Playlist Trimmer (`/hls/<id>.m3u8`):** Broadcasters like TRT serve massive 24-hour DVR playlists (`30,246 lines / 878 KB`) whose Akamai edge nodes occasionally pause 6–8s on cache misses. FastIPTV caches trimmed responses for `1.5s`, scans backwards from the end of the playlist to resolve only the last **12 live segments** (`72s` window, `< 1 ms` CPU time, zero GC pressure), and starts `ffmpeg` at `-live_start_index -5` (`30s` live cushion).
 - **TRT 44.1 kHz Audio & SCTE-35 Timestamp Sync:** Strips un-timestamped SCTE-35 splice streams (`-dn`), applies asynchronous audio timestamp drift compensation (`-af aresample=async=1:first_pts=0`) for 44.1 kHz -> 48 kHz AC3 conversion, and enforces zero-based monotonic timestamps (`-fflags +genpts+discardcorrupt -avoid_negative_ts make_zero -max_interleave_delta 0`).
 - **Zero Background Bandwidth Contention:** Pauses background playlist warm-up completely whenever any live channel is actively streaming.
